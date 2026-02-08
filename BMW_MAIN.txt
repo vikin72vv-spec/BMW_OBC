@@ -1,0 +1,1208 @@
+/*
+ * ==========================================
+ * PROJECT: BMW E34 DIGITAL OBC (M-Technic)
+ * HARDWARE: ESP32 WROOM + TFT 3.5" (ST7796)
+ * MODULES:  DS3231 (RTC), DS18B20 (Temp), DFPlayer (Audio)
+ * VERSION:  7.1 
+ * AUTHOR:   https://github.com/vikin72vv-spec/BMW_OBC/tree/main
+ * ==========================================
+ * FEATURES:
+ * 1. Modes: Dashboard, Big Clock, Temp, Volt Diag, RPM Diag, Service, Weather.
+ * 2. Connectivity: Wi-Fi Control, OTA Firmware Update (GitHub).
+ * 3. Audio: Button clicks, Alarm alerts, Startup sound.
+ * 4. Diagnostics: Min/Max logging for RPM & Voltage.
+ * 5. Safety: Engine overheating & Low voltage alarms + WDT.
+ * 6. (4-Zone Color for Temp Screen)
+ */
+
+#include <WiFi.h>
+#include <HTTPClient.h>
+#include <WiFiClientSecure.h>
+#include <ArduinoJson.h>
+#include <HardwareSerial.h>
+#include <Wire.h>
+#include <RTClib.h>
+#include <OneWire.h>
+#include <DallasTemperature.h>
+#include <Preferences.h>
+#include <WebServer.h>
+#include <Update.h>
+#include <esp_task_wdt.h>
+
+#include <ESPmDNS.h>
+#include <WiFiUdp.h>
+#include <ArduinoOTA.h>
+
+#define LGFX_USE_V1
+#include <LovyanGFX.hpp>
+#include "logo.h"
+#include <pgmspace.h>
+
+// ================= НАСТРОЙКИ WI-FI =================
+const char* wifi_ssid = "arduino";
+const char* wifi_pass = "12345678";
+
+const char* VERSION_URL = "https://raw.githubusercontent.com/vikin72vv-spec/BMW_OBC/main/version.txt";
+const char* FIRMWARE_URL = "https://raw.githubusercontent.com/vikin72vv-spec/BMW_OBC/main/BMW_OBC.bin";
+String CURRENT_VERSION = "7.1";
+
+const char* CITY_NAME = "Mineralnye Vody";
+const float LATITUDE = 44.21;
+const float LONGITUDE = 43.13;
+
+#define WDT_TIMEOUT 8
+
+// ПИНЫ
+#define PIN_SCLK 12
+#define PIN_MOSI 11
+#define PIN_MISO 40
+#define PIN_DC 38
+#define PIN_CS 10
+#define PIN_RST 39
+#define PIN_BLK 42
+#define MP3_RX 16
+#define MP3_TX 17
+#define PIN_BUTTON 15
+#define PIN_DS18B20 21
+#define PIN_VOLT 4
+#define PIN_RPM 5
+#define PIN_SPEED 23
+#define PIN_SDA 1
+#define PIN_SCL 2
+
+// ЦВЕТА
+#define BMW_AMBER 0xFD20
+#define COLOR_ALERT 0xF800
+#define COLOR_OK 0x07E0
+#define COLOR_BG 0x0000
+#define COLOR_GAUGE_BG 0x2104
+#define COLOR_FRAME 0x528A
+#define COLOR_DARK_GREY 0x1082
+#define TFT_BLACK 0x0000
+#define TFT_WHITE 0xFFFF
+#define TFT_GREY 0x8410
+#define TFT_YELLOW 0xFFE0
+#define TFT_BLUE 0x001F
+#define STATUS_BG 0x18E3
+
+// Заглушка шрифта
+const uint8_t PixelOperator_RusBitmaps[] PROGMEM = { 0x00 };
+const GFXglyph PixelOperator_RusGlyphs[] PROGMEM = { { 0, 0, 0, 0, 0, 0 } };
+const GFXfont PixelOperator_Rus PROGMEM = { (uint8_t*)PixelOperator_RusBitmaps, (GFXglyph*)PixelOperator_RusGlyphs, 0, 0, 0 };
+
+class LGFX : public lgfx::LGFX_Device {
+  lgfx::Panel_ST7796 _panel_instance;
+  lgfx::Bus_SPI _bus_instance;
+  lgfx::Light_PWM _light_instance;
+public:
+  LGFX(void) {
+    {
+      auto cfg = _bus_instance.config();
+      cfg.spi_host = SPI2_HOST;
+      cfg.freq_write = 40000000;
+      cfg.pin_sclk = PIN_SCLK;
+      cfg.pin_mosi = PIN_MOSI;
+      cfg.pin_miso = PIN_MISO;
+      cfg.pin_dc = PIN_DC;
+      _bus_instance.config(cfg);
+      _panel_instance.setBus(&_bus_instance);
+    }
+    {
+      auto cfg = _panel_instance.config();
+      cfg.pin_cs = PIN_CS;
+      cfg.pin_rst = PIN_RST;
+      cfg.pin_busy = -1;
+      cfg.panel_width = 320;
+      cfg.panel_height = 480;
+      cfg.offset_rotation = 0;
+      cfg.readable = false;
+      cfg.invert = false;
+      cfg.rgb_order = true;
+      cfg.bus_shared = true;
+      _panel_instance.config(cfg);
+    }
+    {
+      auto cfg = _light_instance.config();
+      cfg.pin_bl = PIN_BLK;
+      cfg.invert = false;
+      cfg.freq = 12000;
+      cfg.pwm_channel = 7;
+      _light_instance.config(cfg);
+      _light_instance.config(cfg);
+      _panel_instance.setLight(&_light_instance);
+    }
+    setPanel(&_panel_instance);
+  }
+};
+
+LGFX tft;
+HardwareSerial myMP3(2);
+RTC_DS3231 rtc;
+OneWire oneWire(PIN_DS18B20);
+DallasTemperature sensors(&oneWire);
+Preferences pref;
+WebServer server(80);
+
+volatile int rpm_pulses = 0;
+volatile int speed_pulses = 0;
+unsigned long timer_update = 0;
+int rpm = 0;
+int speed_kmh = 0;
+float volt = 0.0;
+float tempC = 0;
+unsigned long engine_total_seconds = 0;
+#define SERVICE_LIMIT_HOURS 300
+
+int update_check_count = 0;
+unsigned long update_timer_start = 0;
+
+// === ТАКСОМЕТР ===
+bool taximeter_mode = false;
+bool taxi_running = false;
+unsigned long taxi_start_time = 0;
+unsigned long taxi_accumulated = 0;
+float taxi_cost_per_min = 10.0;
+
+float volt_min = 20.0;
+float volt_max = 0.0;
+int rpm_min = 10000;
+int rpm_max = 0;
+
+int current_bri = 255;
+int current_vol = 25;
+bool auto_bri = false;
+int pulses_per_km = 4712;
+int corr_temp = 0;
+int corr_rpm = 0;
+float corr_volt = 0.0;
+int display_mode = 0;
+#define MAX_MODES 7
+
+#define BUF_W 280
+int hist_temp[BUF_W];
+int hist_volt[BUF_W];
+int hist_rpm[BUF_W];
+int buf_idx = 0;
+
+String weatherDesc = "Loading...";
+int weatherCode = 0;
+float tempAir = 0.0;
+bool weatherUpdated = false;
+bool updateAvailable = false;
+
+// HTML ИНТЕРФЕЙС
+const char index_html[] PROGMEM = R"rawliteral(
+<!DOCTYPE HTML><html><head><title>BMW OBC V7.2</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<style>
+body{font-family:Arial;background:#111;color:#eee;text-align:center;margin:0;padding:5px}
+h1{font-size:20px;margin:5px;color:#e67e22}
+.box{border:1px solid #333;margin:5px 0;padding:5px;border-radius:4px;background:#222}
+.grid{display:grid;grid-template-columns:1fr 1fr;gap:5px}
+.btn{background:#444;color:white;padding:10px 0;border:none;width:100%;font-size:14px;border-radius:3px;cursor:pointer}
+.btn:active{background:#666}
+.btn-org{background:#e67e22;color:#000;font-weight:bold}
+.btn-red{background:#c0392b}
+.btn-grn{background:#27ae60}
+input{padding:5px;width:60px;text-align:center;background:#333;color:white;border:1px solid #555;border-radius:3px}
+label{font-size:14px}
+h3{margin:5px 0;font-size:16px;border-bottom:1px solid #444;padding-bottom:2px}
+</style></head><body>
+<h1>BMW E34 CONTROL</h1>
+<div class="box"><h3>SCREENS</h3><div class="grid">
+<button class="btn" onclick="fetch('/set?m=0')">DASHBOARD</button>
+<button class="btn" onclick="fetch('/set?m=1')">CLOCK</button>
+<button class="btn" onclick="fetch('/set?m=3')">VOLT</button>
+<button class="btn" onclick="fetch('/set?m=4')">RPM</button>
+<button class="btn" onclick="fetch('/set?m=6')">WEATHER</button>
+<button class="btn" onclick="fetch('/set?m=7')">STATUS</button>
+</div></div>
+<div class="box" style="border:1px solid #e67e22"><h3>TAXIMETER</h3>
+<form action="/set_taxi" method="get" style="display:flex;justify-content:center;align-items:center;gap:10px;margin-bottom:5px">
+ <label>Cost/Min:</label><input name="c" value="%COST%" step="0.1"><button class="btn btn-grn" style="width:auto;padding:5px 10px">SAVE</button>
+</form>
+<button class="btn btn-org" onclick="fetch('/taxi_on')">ACTIVATE MODE</button><button class="btn" onclick="fetch('/taxi_reset')">RESET COUNTER</button>
+</div>
+<div class="box"><h3>SETTINGS</h3>
+<form action="/set_bri" style="margin-bottom:5px"><label>Bri:</label> <input type="range" name="b" min="10" max="255" value="%BRI%" onchange="this.form.submit()" style="width:100px;vertical-align:middle"><label><input type="checkbox" name="a" value="1" %CHK% onchange="this.form.submit()"> Auto</label></form>
+<form action="/set_vol"><label>Vol:</label> <input type="range" name="v" min="0" max="30" value="%VOL%" onchange="this.form.submit()" style="width:100px;vertical-align:middle"></form>
+<form action="/set_sp" style="margin-top:5px"><label>Imp/Km:</label> <input name="s" value="%SP%"> <button class="btn" style="width:auto;padding:5px">SET</button></form>
+</div>
+<div class="box"><h3>CALIBRATION</h3><form action="/set_corr" class="grid" style="grid-template-columns:1fr 1fr 1fr">
+ <div>T: <input name="t" value="%CT%" style="width:40px"></div><div>R: <input name="r" value="%CR%" style="width:40px"></div><div>V: <input name="v" value="%CV%" style="width:40px"></div>
+ <button class="btn" style="grid-column:1/4">SAVE CORRECTIONS</button></form></div>
+<div class="box"><div class="grid"><button class="btn btn-grn" onclick="if(confirm('Update?')) fetch('/ota')">UPDATE FW</button><button class="btn btn-red" onclick="fetch('/reboot')">REBOOT</button></div></div>
+</body></html>)rawliteral";
+
+void IRAM_ATTR rpm_interrupt() {
+  rpm_pulses++;
+}
+void IRAM_ATTR speed_interrupt() {
+  speed_pulses++;
+}
+
+void sendMP3Command(byte command, byte dat1, byte dat2) {
+  byte buffer[10] = { 0x7E, 0xFF, 0x06, command, 0x00, dat1, dat2, 0x00, 0x00, 0xEF };
+  uint16_t sum = 0;
+  for (int i = 1; i < 7; i++) sum += buffer[i];
+  sum = -sum;
+  buffer[7] = (byte)(sum >> 8);
+  buffer[8] = (byte)(sum);
+  myMP3.write(buffer, 10);
+}
+void playTrack(int folder, int track) {
+  sendMP3Command(0x0F, (byte)folder, (byte)track);
+}
+void setVolume(int vol) {
+  sendMP3Command(0x06, 0, (byte)vol);
+}
+
+// === ОБНОВЛЕНИЕ ПОГОДЫ ===
+void updateWeather() {
+  if (WiFi.status() != WL_CONNECTED) {
+    weatherDesc = "No WiFi";
+    return;
+  }
+  WiFiClient client;
+  HTTPClient http;
+  String url = "http://api.open-meteo.com/v1/forecast?latitude=" + String(LATITUDE) + "&longitude=" + String(LONGITUDE) + "&current_weather=true";
+  http.begin(client, url);
+  int httpCode = http.GET();
+  if (httpCode == 200) {
+    String payload = http.getString();
+    JsonDocument doc;
+    deserializeJson(doc, payload);
+    tempAir = doc["current_weather"]["temperature"];
+    weatherCode = doc["current_weather"]["weathercode"];
+
+    // Английские надписи
+    if (weatherCode == 0) weatherDesc = "Clear Sky";
+    else if (weatherCode < 3) weatherDesc = "Cloudy";
+    else if (weatherCode < 48) weatherDesc = "Fog";
+    else if (weatherCode < 60) weatherDesc = "Drizzle";
+    else if (weatherCode < 80) weatherDesc = "Rain";
+    else if (weatherCode < 86) weatherDesc = "Snow";
+    else if (weatherCode > 90) weatherDesc = "Thunderstorm";
+    else weatherDesc = "Precipitation";
+
+    weatherUpdated = true;
+  }
+  http.end();
+}
+
+void checkVersionSilent() {
+  if (WiFi.status() != WL_CONNECTED) return;
+  WiFiClientSecure client;
+  client.setInsecure();
+  HTTPClient http;
+  http.setTimeout(3000);
+  http.begin(client, VERSION_URL);
+  int httpCode = http.GET();
+  if (httpCode == 200) {
+    String newVerStr = http.getString();
+    newVerStr.trim();
+    float newVer = newVerStr.toFloat();
+    float curVer = CURRENT_VERSION.toFloat();
+    if (newVer > curVer) updateAvailable = true;
+    else updateAvailable = false;
+  }
+  http.end();
+}
+
+// === ОБНОВЛЕНИЕ С GITHUB ===
+void performOTA() {
+  tft.fillScreen(TFT_BLACK);
+  tft.setTextColor(TFT_WHITE, TFT_BLACK);
+  tft.setTextSize(2);
+
+  tft.setCursor(10, 15);
+  tft.println("CHECKING VERSION...");
+
+  WiFiClientSecure client;
+  client.setInsecure();
+  HTTPClient http;
+  http.setTimeout(30000);
+  http.begin(client, VERSION_URL);
+  int httpCode = http.GET();
+  if (httpCode == 200) {
+    String newVerStr = http.getString();
+    newVerStr.trim();
+    float newVer = newVerStr.toFloat();
+    float curVer = CURRENT_VERSION.toFloat();
+    tft.print("SERVER: ");
+    tft.println(newVerStr);
+    tft.print("CURRENT: ");
+    tft.println(CURRENT_VERSION);
+    if (newVer <= curVer) {
+      tft.setTextColor(COLOR_OK, TFT_BLACK);
+      tft.println("\nNO UPDATE NEEDED");
+      http.end();
+      delay(3000);
+      drawScreen(true);
+      return;
+    }
+  } else {
+    tft.setTextColor(COLOR_ALERT, TFT_BLACK);
+    tft.print("VER ERR: ");
+    tft.println(httpCode);
+    http.end();
+    delay(5000);
+    drawScreen(true);
+    return;
+  }
+  http.end();
+
+  tft.setTextColor(BMW_AMBER, TFT_BLACK);
+  tft.println("\nDOWNLOADING...");
+
+  // === БОЛЬШАЯ НАДПИСЬ ПО ЦЕНТРУ ===
+  tft.setTextColor(COLOR_ALERT, TFT_BLACK);
+  tft.setTextSize(3);
+  tft.setCursor(5, 110);
+  tft.print("DO NOT POWER OFF!");
+
+  http.begin(client, FIRMWARE_URL);
+  http.setTimeout(30000);
+  httpCode = http.GET();
+  if (httpCode == 200) {
+    int contentLength = http.getSize();
+    if (Update.begin(contentLength)) {
+      WiFiClient* stream = http.getStreamPtr();
+      uint8_t buff[128];
+      int totalRead = 0;
+      while (http.connected() && (totalRead < contentLength)) {
+        esp_task_wdt_reset();
+        size_t size = stream->available();
+        if (size) {
+          int c = stream->readBytes(buff, ((size > sizeof(buff)) ? sizeof(buff) : size));
+          Update.write(buff, c);
+          totalRead += c;
+          int percent = (totalRead * 100) / contentLength;
+
+          // === ПОЛОСКА ОПУЩЕНА (Y=195) ===
+          tft.drawRect(10, 195, 300, 20, COLOR_FRAME);
+          int fillW = map(percent, 0, 100, 0, 296);
+          tft.fillRect(12, 197, fillW, 16, COLOR_OK);
+
+          // === ПРОЦЕНТЫ ОПУЩЕНЫ (Y=170) ===
+          tft.setCursor(140, 170);
+          tft.setTextColor(TFT_WHITE, TFT_BLACK);
+          tft.setTextSize(2);
+          tft.print(percent);
+          tft.print("%");
+        }
+      }
+
+      if (Update.end()) {
+        if (Update.isFinished()) {
+          tft.fillScreen(COLOR_OK);
+          tft.setTextColor(TFT_BLACK);
+          tft.setCursor(40, 100);
+          tft.setTextSize(3);
+          tft.println("UPDATE SUCCESS!");
+          delay(1000);
+          ESP.restart();
+        }
+      } else {
+        tft.setTextColor(COLOR_ALERT, TFT_BLACK);
+        tft.setCursor(10, 160);
+        tft.println("WRITE ERR!");
+      }
+    } else {
+      tft.setTextColor(COLOR_ALERT, TFT_BLACK);
+      tft.setCursor(10, 160);
+      tft.println("NO SPACE");
+    }
+  } else {
+    tft.setTextColor(COLOR_ALERT, TFT_BLACK);
+    tft.setCursor(10, 160);
+    tft.print("DL ERR: ");
+    tft.println(httpCode);
+  }
+  http.end();
+  delay(5000);
+  drawScreen(true);
+}
+
+void drawCheckEngineError(bool blinkState) {
+  tft.fillScreen(TFT_BLACK);
+  if (blinkState) {
+    tft.drawRoundRect(60, 60, 200, 120, 10, COLOR_ALERT);
+    tft.drawRoundRect(61, 61, 198, 118, 10, COLOR_ALERT);
+    tft.drawRoundRect(62, 62, 196, 116, 10, COLOR_ALERT);
+    tft.fillRoundRect(120, 40, 80, 20, 5, COLOR_ALERT);
+    tft.fillRect(30, 80, 30, 80, COLOR_ALERT);
+    tft.fillTriangle(260, 90, 260, 150, 290, 120, COLOR_ALERT);
+    tft.setTextColor(COLOR_ALERT, TFT_BLACK);
+    tft.setTextSize(4);
+    tft.setCursor(95, 80);
+    tft.print("CHECK");
+    tft.setCursor(85, 120);
+    tft.print("ENGINE");
+  }
+}
+
+void drawHand(int x, int y, int length, int angle, int color, int width) {
+  float rad = (angle - 90) * 0.0174532925;
+  int x2 = x + cos(rad) * length;
+  int y2 = y + sin(rad) * length;
+  tft.drawLine(x, y, x2, y2, color);
+  if (width > 1) {
+    tft.drawLine(x + 1, y + 1, x2 + 1, y2 + 1, color);
+    tft.drawLine(x - 1, y - 1, x2 - 1, y2 - 1, color);
+  }
+}
+
+void drawTicks(int x, int y, int r, int start_angle, int end_angle, int num_ticks, uint16_t color, int len) {
+  float step = (end_angle - start_angle) / (float)(num_ticks - 1);
+  for (int i = 0; i < num_ticks; i++) {
+    float angle = start_angle + i * step;
+    float rad = (angle - 90) * 0.0174532925;
+    int x1 = x + cos(rad) * (r - len);
+    int y1 = y + sin(rad) * (r - len);
+    int x2 = x + cos(rad) * r;
+    int y2 = y + sin(rad) * r;
+    tft.drawLine(x1, y1, x2, y2, color);
+  }
+}
+
+void drawGauge(int x, int y, int r, int thick, float val, float min_val, float max_val, int start_angle, int end_angle, uint16_t color) {
+  float range_val = max_val - min_val;
+  float range_angle = end_angle - start_angle;
+  float constrained_val = constrain(val, min_val, max_val);
+  float angle_val = start_angle + ((constrained_val - min_val) / range_val) * range_angle;
+  tft.fillArc(x, y, r, r - thick, angle_val, end_angle, COLOR_GAUGE_BG);
+  tft.fillArc(x, y, r, r - thick, start_angle, angle_val, color);
+  tft.drawArc(x, y, r, r, start_angle, end_angle, COLOR_FRAME);
+  tft.drawArc(x, y, r - thick, r - thick, start_angle, end_angle, COLOR_FRAME);
+}
+
+void drawClock(bool redraw_static) {
+  DateTime now = rtc.now();
+  int centerX = 160;
+  int centerY = 130;
+  if (redraw_static) {
+    tft.fillScreen(TFT_BLACK);
+    tft.drawCircle(centerX, centerY, 100, BMW_AMBER);
+    tft.drawCircle(centerX, centerY, 101, BMW_AMBER);
+    drawTicks(centerX, centerY, 100, 0, 360, 12, BMW_AMBER, 12);
+    tft.setFont(nullptr);
+    tft.setTextSize(2);
+    tft.setTextColor(BMW_AMBER);
+    for (int n = 1; n <= 12; n++) {
+      float a = (n - 3) * 30 * 0.0174533;
+      tft.setCursor(centerX + cos(a) * 88 - 6, centerY + sin(a) * 88 - 8);
+      tft.print(n);
+    }
+  }
+  tft.fillCircle(centerX, centerY, 78, TFT_BLACK);
+  drawHand(centerX, centerY, 50, now.hour() * 30 + now.minute() * 0.5, BMW_AMBER, 5);
+  drawHand(centerX, centerY, 68, now.minute() * 6, BMW_AMBER, 3);
+  drawHand(centerX, centerY, 72, now.second() * 6, COLOR_ALERT, 1);
+  tft.fillCircle(centerX, centerY, 6, BMW_AMBER);
+}
+
+void drawWeatherIcon(int x, int y, int code) {
+  if (code == 0) {
+    tft.fillCircle(x, y, 30, TFT_YELLOW);
+    for (int i = 0; i < 8; i++) {
+      float ang = i * 45 * 0.0174;
+      tft.drawLine(x + cos(ang) * 35, y + sin(ang) * 35, x + cos(ang) * 45, y + sin(ang) * 45, TFT_YELLOW);
+    }
+  } else if (code > 0 && code < 50) {
+    tft.fillCircle(x - 20, y, 20, TFT_GREY);
+    tft.fillCircle(x + 20, y + 5, 18, TFT_GREY);
+    tft.fillCircle(x, y - 10, 25, TFT_WHITE);
+  } else if ((code >= 50 && code < 70) || code >= 80) {
+    tft.fillCircle(x - 20, y, 20, TFT_GREY);
+    tft.fillCircle(x + 20, y + 5, 18, TFT_GREY);
+    tft.fillCircle(x, y - 10, 25, TFT_WHITE);
+    tft.drawLine(x - 10, y + 25, x - 15, y + 35, TFT_BLUE);
+    tft.drawLine(x, y + 25, x - 5, y + 35, TFT_BLUE);
+    tft.drawLine(x + 10, y + 25, x + 5, y + 35, TFT_BLUE);
+  } else {
+    tft.fillCircle(x - 20, y, 20, TFT_GREY);
+    tft.fillCircle(x + 20, y + 5, 18, TFT_GREY);
+    tft.fillCircle(x - 10, y + 30, 2, TFT_WHITE);
+    tft.fillCircle(x + 10, y + 30, 2, TFT_WHITE);
+    tft.fillCircle(x, y + 40, 2, TFT_WHITE);
+  }
+}
+
+void drawStatusBar(bool full_redraw) {
+  if (full_redraw) { tft.fillRect(0, 218, 320, 22, STATUS_BG); }
+  int rssi = WiFi.RSSI();
+  uint16_t wifiCol = COLOR_DARK_GREY;
+  if (WiFi.status() == WL_CONNECTED) {
+    if (rssi > -60) wifiCol = COLOR_OK;
+    else if (rssi > -80) wifiCol = BMW_AMBER;
+    else wifiCol = COLOR_ALERT;
+  }
+  tft.fillRect(5, 235, 3, 3, (WiFi.status() == WL_CONNECTED) ? wifiCol : COLOR_DARK_GREY);
+  tft.fillRect(10, 232, 3, 6, (WiFi.status() == WL_CONNECTED && rssi > -90) ? wifiCol : COLOR_DARK_GREY);
+  tft.fillRect(15, 229, 3, 9, (WiFi.status() == WL_CONNECTED && rssi > -80) ? wifiCol : COLOR_DARK_GREY);
+  tft.fillRect(20, 226, 3, 12, (WiFi.status() == WL_CONNECTED && rssi > -60) ? wifiCol : COLOR_DARK_GREY);
+
+  DateTime now = rtc.now();
+  tft.setTextColor(TFT_WHITE, STATUS_BG);
+  tft.setTextSize(2);
+  tft.setCursor(120, 219);
+  if (now.hour() < 10) tft.print('0');
+  tft.print(now.hour());
+  tft.print(':');
+  if (now.minute() < 10) tft.print('0');
+  tft.print(now.minute());
+  tft.setCursor(240, 219);
+  if (volt < 12.0) tft.setTextColor(COLOR_ALERT, STATUS_BG);
+  else tft.setTextColor(BMW_AMBER, STATUS_BG);
+  tft.print(volt, 1);
+  tft.print("V");
+}
+
+void drawCenteredTitle(String title) {
+  tft.setFont(nullptr);
+  tft.setTextSize(2);
+  tft.setTextColor(BMW_AMBER, TFT_BLACK);
+  int w = title.length() * 12;
+  int x = (320 - w) / 2;
+  tft.setCursor(x, 10);
+  tft.print(title);
+}
+
+void showStartupAnimation() {
+  tft.setBrightness(255);
+  tft.fillScreen(TFT_BLACK);
+  tft.setFont(nullptr);
+  tft.setTextSize(4);
+  tft.setTextColor(BMW_AMBER, TFT_BLACK);
+  int w = tft.textWidth("BMW E34");
+  tft.setCursor((320 - w) / 2, 80);
+  tft.print("BMW E34");
+  tft.setTextSize(2);
+  w = tft.textWidth("SYSTEM START");
+  tft.setCursor((320 - w) / 2, 130);
+  tft.print("SYSTEM START");
+  tft.drawRect(60, 180, 200, 8, BMW_AMBER);
+  for (int i = 0; i < 196; i += 4) {
+    tft.fillRect(62, 182, i, 4, BMW_AMBER);
+    delay(10);
+  }
+  delay(500);
+  tft.fillScreen(TFT_BLACK);
+  drawCenteredTitle("TEST...");
+  for (int i = 0; i <= 100; i += 2) {
+    float t_val = map(i, 0, 100, 0, 130);
+    float v_val = map(i, 0, 100, 100, 160) / 10.0;
+    drawGauge(80, 140, 70, 10, t_val, 0, 130, 135, 405, BMW_AMBER);
+    drawGauge(240, 140, 70, 10, v_val, 10, 16, 135, 405, BMW_AMBER);
+    delay(10);
+  }
+  for (int i = 100; i >= 0; i -= 2) {
+    float t_val = map(i, 0, 100, 0, 130);
+    float v_val = map(i, 0, 100, 100, 160) / 10.0;
+    drawGauge(80, 140, 70, 10, t_val, 0, 130, 135, 405, BMW_AMBER);
+    drawGauge(240, 140, 70, 10, v_val, 10, 16, 135, 405, BMW_AMBER);
+    delay(10);
+  }
+  delay(200);
+  tft.fillScreen(TFT_BLACK);
+}
+
+void drawScreen(bool redraw_static) {
+  esp_task_wdt_reset();
+  if (taximeter_mode) {
+    if (redraw_static) {
+      tft.fillScreen(TFT_BLACK);
+      drawCenteredTitle("TAXIMETER");
+      tft.drawLine(0, 40, 320, 40, BMW_AMBER);
+    }
+    unsigned long current_time = 0;
+    if (taxi_running) current_time = taxi_accumulated + (millis() - taxi_start_time);
+    else current_time = taxi_accumulated;
+    unsigned long total_sec = current_time / 1000;
+    unsigned long mm = total_sec / 60;
+    unsigned long ss = total_sec % 60;
+    float cost = (total_sec / 60.0) * taxi_cost_per_min;
+    tft.setFont(&Digital7_40pt7b);
+    tft.setTextSize(2);
+    tft.setTextColor(taxi_running ? COLOR_OK : BMW_AMBER, TFT_BLACK);
+    tft.setCursor(20, 60);
+    if (mm < 10) tft.print("0");
+    tft.print(mm);
+    tft.setCursor(145, 60);
+    tft.print(":");
+    tft.setCursor(180, 60);
+    if (ss < 10) tft.print("0");
+    tft.print(ss);
+    tft.setFont(&Digital7_40pt7b);
+    tft.setTextSize(1);
+    tft.setTextColor(TFT_WHITE, TFT_BLACK);
+    tft.setCursor(40, 170);
+    tft.print((int)cost);
+    tft.setFont(nullptr);
+    tft.setTextSize(2);
+    tft.setCursor(tft.getCursorX() + 10, 185);
+    tft.print("RUB");
+    return;
+  }
+  if (display_mode == 0) {
+    if (redraw_static) {
+      tft.fillScreen(TFT_BLACK);
+      drawCenteredTitle("DIGITAL DASH");
+      tft.setTextSize(2);
+      tft.setTextColor(TFT_WHITE, TFT_BLACK);
+      tft.setCursor(55, 185);
+      tft.print("TEMP");
+      tft.setCursor(235, 185);
+      tft.print("VOLT");
+    }
+    uint16_t t_col;
+    if (tempC < 35) t_col = TFT_BLUE;
+    else if (tempC < 65) t_col = BMW_AMBER;
+    else if (tempC < 104) t_col = COLOR_OK;
+    else t_col = COLOR_ALERT;
+    drawGauge(80, 140, 70, 10, tempC, 0, 130, 135, 405, t_col);
+    drawTicks(80, 140, 80, 135, 405, 7, TFT_WHITE, 8);
+    String t_str = String((int)tempC);
+    tft.setFont(&Digital7_40pt7b);
+    tft.setTextSize(1);
+    tft.setTextColor(t_col, TFT_BLACK);
+    int tw = tft.textWidth(t_str);
+    tft.setCursor(80 - (tw / 2), 155);
+    tft.print(t_str);
+    tft.setFont(nullptr);
+    uint16_t v_col = BMW_AMBER;
+    if (volt < 12.0 || volt > 14.8) v_col = COLOR_ALERT;
+    drawGauge(240, 140, 70, 10, volt, 10, 16, 135, 405, v_col);
+    drawTicks(240, 140, 80, 135, 405, 7, TFT_WHITE, 8);
+    String v_str = String(volt, 1);
+    tft.setFont(&Digital7_40pt7b);
+    tft.setTextSize(1);
+    tft.setTextColor(v_col, TFT_BLACK);
+    int vw = tft.textWidth(v_str);
+    tft.setCursor(240 - (vw / 2), 155);
+    tft.print(v_str);
+    tft.setFont(nullptr);
+  } else if (display_mode == 1) {
+    drawClock(redraw_static);
+  } else if (display_mode == 2) {
+    if (redraw_static) {
+      tft.fillScreen(TFT_BLACK);
+      drawCenteredTitle("COOLANT TEMP");
+    }
+    // 4-ZONE LOGIC FOR SCREEN 2
+    uint16_t t_col;
+    if (tempC < 35) t_col = TFT_BLUE;
+    else if (tempC < 65) t_col = BMW_AMBER;
+    else if (tempC < 104) t_col = COLOR_OK;
+    else t_col = COLOR_ALERT;
+    drawGauge(160, 135, 90, 15, tempC, 0, 130, 135, 405, t_col);
+    drawTicks(160, 135, 95, 135, 405, 7, TFT_WHITE, 8);
+    String t_str = String((int)tempC);
+    tft.setFont(&Digital7_40pt7b);
+    tft.setTextSize(1);
+    tft.setTextColor(t_col, TFT_BLACK);
+    int tw = tft.textWidth(t_str);
+    tft.setCursor(160 - (tw / 2), 155);
+    tft.print(t_str);
+    tft.setFont(nullptr);
+  } else if (display_mode == 3) {
+    if (redraw_static) {
+      tft.fillScreen(TFT_BLACK);
+      drawCenteredTitle("BATTERY VOLTAGE");
+    }
+    drawGauge(160, 120, 90, 15, volt, 10, 16, 135, 405, COLOR_OK);
+    String v_str = String(volt, 1);
+    tft.setFont(&Digital7_40pt7b);
+    tft.setTextSize(1);
+    tft.setTextColor(BMW_AMBER, TFT_BLACK);
+    int vw = tft.textWidth(v_str);
+    tft.setCursor(160 - (vw / 2), 140);
+    tft.print(v_str);
+    tft.setFont(nullptr);
+    tft.setTextSize(2);
+    tft.setTextColor(COLOR_ALERT, TFT_BLACK);
+    tft.setCursor(30, 200);
+    tft.print("MIN:");
+    tft.print(volt_min, 1);
+    tft.setTextColor(COLOR_OK, TFT_BLACK);
+    tft.setCursor(190, 200);
+    tft.print("MAX:");
+    tft.print(volt_max, 1);
+  } else if (display_mode == 4) {
+    if (redraw_static) {
+      tft.fillScreen(TFT_BLACK);
+      drawCenteredTitle("ENGINE SPEED");
+      tft.drawArc(160, 120, 100, 98, 304, 405, COLOR_ALERT);
+    }
+    drawGauge(160, 120, 90, 15, rpm, 0, 8000, 135, 405, (rpm > 5000) ? COLOR_ALERT : BMW_AMBER);
+    String r_str = String(rpm);
+    tft.setFont(&Digital7_40pt7b);
+    tft.setTextSize(1);
+    tft.setTextColor(BMW_AMBER, TFT_BLACK);
+    int rw = tft.textWidth(r_str);
+    tft.setCursor(160 - (rw / 2), 140);
+    tft.print(r_str);
+    tft.setFont(nullptr);
+    tft.setTextSize(2);
+    tft.setTextColor(COLOR_OK, TFT_BLACK);
+    tft.setCursor(30, 200);
+    tft.print("MIN:");
+    if (rpm_min > 9000) tft.print("-");
+    else tft.print(rpm_min);
+    tft.setTextColor(COLOR_ALERT, TFT_BLACK);
+    tft.setCursor(190, 200);
+    tft.print("MAX:");
+    tft.print(rpm_max);
+  } else if (display_mode == 5) {
+    if (redraw_static) {
+      tft.fillScreen(TFT_BLACK);
+      tft.fillRect(0, 0, 320, 45, COLOR_DARK_GREY);
+      tft.setTextSize(3);
+      tft.setTextColor(BMW_AMBER);
+      tft.setCursor(20, 12);
+      tft.print("SERVICE INTERVAL");
+    }
+    int total_hours = engine_total_seconds / 3600;
+    int squares_gone = map(total_hours, 0, SERVICE_LIMIT_HOURS, 0, 8);
+    if (squares_gone > 8) squares_gone = 8;
+    for (int i = 0; i < 8; i++) {
+      uint16_t col = COLOR_DARK_GREY;
+      if (i >= squares_gone) {
+        if (i < 5) col = COLOR_OK;
+        else if (i == 5) col = BMW_AMBER;
+        else col = COLOR_ALERT;
+      }
+      tft.fillRoundRect(25 + i * 35, 80, 30, 30, 4, col);
+      tft.drawRoundRect(25 + i * 35, 80, 30, 30, 4, COLOR_FRAME);
+    }
+    tft.setTextSize(2);
+    tft.setTextColor(TFT_WHITE, TFT_BLACK);
+    tft.setCursor(20, 140);
+    tft.print("WORKED:");
+    tft.setCursor(180, 140);
+    tft.setTextColor(BMW_AMBER, TFT_BLACK);
+    tft.print(total_hours);
+    tft.print(" h");
+    tft.setTextColor(TFT_WHITE, TFT_BLACK);
+    tft.setCursor(20, 170);
+    tft.print("LIMIT:");
+    tft.setCursor(180, 170);
+    tft.setTextColor(TFT_WHITE, TFT_BLACK);
+    tft.print(SERVICE_LIMIT_HOURS);
+    tft.print(" h");
+    String statusStr = "OK";
+    uint16_t statusCol = COLOR_OK;
+    if (squares_gone >= 5) {
+      statusStr = "OIL SERVICE";
+      statusCol = BMW_AMBER;
+    }
+    if (squares_gone >= 7) {
+      statusStr = "INSPECTION!";
+      statusCol = COLOR_ALERT;
+    }
+    tft.fillRect(0, 195, 320, 20, statusCol);
+    tft.setTextSize(2);
+    tft.setTextColor(TFT_BLACK);
+    tft.setCursor(10, 197);
+    tft.print(statusStr);
+  } else if (display_mode == 6) {
+    if (redraw_static) {
+      tft.fillScreen(TFT_BLACK);
+      tft.fillRect(0, 0, 320, 40, BMW_AMBER);
+      tft.setFont(nullptr);
+      tft.setTextSize(2);
+      tft.setTextColor(TFT_BLACK);
+      tft.setCursor(10, 12);
+      tft.print(CITY_NAME);
+      tft.setTextColor(TFT_WHITE, TFT_BLACK);
+      tft.setTextSize(2);
+      tft.setCursor(10, 50);
+      tft.print(weatherDesc);
+    }
+    drawWeatherIcon(260, 90, weatherCode);
+    tft.setTextSize(6);
+    tft.setTextColor(BMW_AMBER, TFT_BLACK);
+    tft.setCursor(80, 165);
+    tft.print(tempAir, 1);
+    tft.setTextSize(2);
+    tft.print(" C");
+  } else if (display_mode == 7) {
+    if (redraw_static) {
+      tft.fillScreen(TFT_BLACK);
+      drawCenteredTitle("SYSTEM STATUS");
+      tft.drawLine(0, 40, 320, 40, BMW_AMBER);
+      tft.setTextSize(2);
+      tft.setTextColor(TFT_WHITE);
+      tft.setCursor(10, 60);
+      tft.print("IP: ");
+      tft.println(WiFi.localIP());
+      tft.setCursor(10, 100);
+      tft.print("Volt Corr: ");
+      tft.print(corr_volt);
+      tft.print(" V");
+      tft.setCursor(10, 130);
+      tft.print("Temp Corr: ");
+      tft.print(corr_temp);
+      tft.print(" C");
+      tft.setCursor(10, 160);
+      tft.print("Ver: ");
+      tft.print(CURRENT_VERSION);
+      if (updateAvailable) {
+        tft.setTextColor(COLOR_OK, TFT_BLACK);
+        tft.print(" [UPDATE!]");
+      }
+      tft.setTextColor(TFT_WHITE);
+      tft.setCursor(10, 190);
+      tft.print("Case Temp: ");
+      tft.print(rtc.getTemperature());
+      tft.print(" C");
+    }
+  }
+  if (display_mode != 1) { drawStatusBar(redraw_static); }
+}
+
+void handleSet() {
+  if (server.hasArg("m")) {
+    playTrack(1, 4);
+    delay(20);
+    if (taximeter_mode) taximeter_mode = false;
+    display_mode = server.arg("m").toInt();
+    tft.fillScreen(TFT_BLACK);
+    drawScreen(true);
+  }
+  server.send(200, "text/plain", "OK");
+}
+void handleTaxiOn() {
+  playTrack(1, 4);
+  taximeter_mode = true;
+  taxi_running = false;
+  taxi_accumulated = 0;
+  drawScreen(true);
+  server.send(200, "text/plain", "OK");
+}
+void handleTaxiReset() {
+  taxi_accumulated = 0;
+  taxi_running = false;
+  if (taximeter_mode) drawScreen(true);
+  server.send(200, "text/plain", "OK");
+}
+void handleSetTaxi() {
+  if (server.hasArg("c")) {
+    taxi_cost_per_min = server.arg("c").toFloat();
+    pref.putFloat("tx", taxi_cost_per_min);
+  }
+  server.sendHeader("Location", "/");
+  server.send(303);
+}
+void handleSetSp() {
+  if (server.hasArg("s")) {
+    pulses_per_km = server.arg("s").toInt();
+    pref.putInt("sp", pulses_per_km);
+  }
+  server.sendHeader("Location", "/");
+  server.send(303);
+}
+
+void handleRoot() {
+  String s = index_html;
+  s.replace("%CT%", String(corr_temp));
+  s.replace("%CR%", String(corr_rpm));
+  s.replace("%CV%", String(corr_volt));
+  s.replace("%BRI%", String(current_bri));
+  s.replace("%VOL%", String(current_vol));
+  s.replace("%CHK%", auto_bri ? "checked" : "");
+  s.replace("%COST%", String(taxi_cost_per_min));
+  s.replace("%SP%", String(pulses_per_km));
+  server.send(200, "text/html", s);
+}
+void handleSetCorr() {
+  if (server.hasArg("t")) {
+    corr_temp = server.arg("t").toInt();
+    pref.putInt("ct", corr_temp);
+  }
+  if (server.hasArg("r")) {
+    corr_rpm = server.arg("r").toInt();
+    pref.putInt("cr", corr_rpm);
+  }
+  if (server.hasArg("v")) {
+    corr_volt = server.arg("v").toFloat();
+    pref.putFloat("cv", corr_volt);
+  }
+  playTrack(1, 4);
+  server.sendHeader("Location", "/");
+  server.send(303);
+}
+void handleSetBri() {
+  if (server.hasArg("b")) {
+    current_bri = server.arg("b").toInt();
+    pref.putInt("bri", current_bri);
+    tft.setBrightness(current_bri);
+  }
+  if (server.hasArg("a")) auto_bri = true;
+  else auto_bri = false;
+  pref.putBool("auto", auto_bri);
+  server.sendHeader("Location", "/");
+  server.send(303);
+}
+void handleSetVol() {
+  if (server.hasArg("v")) {
+    current_vol = server.arg("v").toInt();
+    setVolume(current_vol);
+    pref.putInt("vol", current_vol);
+  }
+  server.sendHeader("Location", "/");
+  server.send(303);
+}
+void handleReset() {
+  engine_total_seconds = 0;
+  pref.putUInt("sec", 0);
+  server.send(200, "text/plain", "OK");
+}
+void handleReboot() {
+  server.send(200, "text/plain", "OK");
+  delay(100);
+  ESP.restart();
+}
+void handleOTA() {
+  server.send(200, "text/plain", "CHECKING...");
+  performOTA();
+}
+
+void setup() {
+  Serial.begin(115200);
+  tft.init();
+  tft.setRotation(3);
+  tft.setBrightness(70);
+  myMP3.begin(9600, SERIAL_8N1, MP3_RX, MP3_TX);
+  delay(500);
+  Wire.begin(PIN_SDA, PIN_SCL);
+  rtc.begin();
+  sensors.begin();
+  delay(200);
+  sensors.requestTemperatures();
+  float initialTemp = sensors.getTempCByIndex(0);
+  pref.begin("bmw", false);
+  corr_temp = pref.getInt("ct", 0);
+  current_vol = pref.getInt("vol", 25);
+  taxi_cost_per_min = pref.getFloat("tx", 10.0);
+  setVolume(current_vol);
+  playTrack(1, 1);
+  if (initialTemp > -55 && initialTemp < 150) {
+    tempC = initialTemp + corr_temp;
+  } else {
+    tempC = 0;
+  }
+  sensors.setWaitForConversion(false);
+  pulses_per_km = pref.getInt("sp", 4712);
+  engine_total_seconds = pref.getUInt("sec", 0);
+  corr_rpm = pref.getInt("cr", 0);
+  corr_volt = pref.getFloat("cv", 0.0);
+  current_bri = pref.getInt("bri", 255);
+  auto_bri = pref.getBool("auto", false);
+  pinMode(PIN_BUTTON, INPUT_PULLUP);
+  attachInterrupt(digitalPinToInterrupt(PIN_RPM), rpm_interrupt, FALLING);
+  pinMode(PIN_SPEED, INPUT_PULLUP);
+  attachInterrupt(digitalPinToInterrupt(PIN_SPEED), speed_interrupt, FALLING);
+  showStartupAnimation();
+  tft.setBrightness(current_bri);
+  WiFi.begin(wifi_ssid, wifi_pass);
+
+  ArduinoOTA.setHostname("BMW-E34-OBC");
+  ArduinoOTA.onStart([]() {
+    tft.setBrightness(255);
+    tft.fillScreen(TFT_BLACK);
+    drawCenteredTitle("PC UPLOAD...");
+  });
+  ArduinoOTA.onProgress([](unsigned int progress, unsigned int total) {
+    int percent = (progress / (total / 100));
+    tft.drawRect(10, 180, 300, 20, COLOR_FRAME);
+    int fillW = map(percent, 0, 100, 0, 296);
+    tft.fillRect(12, 182, fillW, 16, COLOR_OK);
+    tft.setCursor(140, 155);
+    tft.print(percent);
+    tft.print("%");
+  });
+  ArduinoOTA.begin();
+
+  if (WiFi.status() == WL_CONNECTED) {
+    updateWeather();
+    checkVersionSilent();
+    update_check_count = 1;
+    update_timer_start = millis();
+  }
+  server.on("/", handleRoot);
+  server.on("/set", handleSet);
+  server.on("/set_corr", handleSetCorr);
+  server.on("/set_bri", handleSetBri);
+  server.on("/set_vol", handleSetVol);
+  server.on("/reset", handleReset);
+  server.on("/reboot", handleReboot);
+  server.on("/ota", handleOTA);
+  server.on("/set_taxi", handleSetTaxi);
+  server.on("/taxi_on", handleTaxiOn);
+  server.on("/taxi_reset", handleTaxiReset);
+  server.on("/set_sp", handleSetSp);
+  server.begin();
+  drawScreen(true);
+  esp_task_wdt_config_t twdt_config = { .timeout_ms = WDT_TIMEOUT * 1000, .idle_core_mask = (1 << 0), .trigger_panic = true };
+  esp_task_wdt_init(&twdt_config);
+  esp_task_wdt_add(NULL);
+}
+
+void loop() {
+  esp_task_wdt_reset();
+  ArduinoOTA.handle();
+  static unsigned long last_wifi_try = 0;
+  if (millis() - last_wifi_try > 60000) {
+    last_wifi_try = millis();
+    if (WiFi.status() != WL_CONNECTED) {
+      WiFi.reconnect();
+    } else {
+      if (!weatherUpdated) updateWeather();
+    }
+  }
+  if (update_check_count < 2 && (millis() - update_timer_start > 120000)) {
+    checkVersionSilent();
+    update_check_count = 2;
+  }
+  server.handleClient();
+  static int last_reading = HIGH;
+  static unsigned long last_db_time = 0;
+  static int btn_state = HIGH;
+  static unsigned long btn_press_start = 0;
+  static bool long_press_handled = false;
+  int reading = digitalRead(PIN_BUTTON);
+  if (reading != last_reading) { last_db_time = millis(); }
+  last_reading = reading;
+  if ((millis() - last_db_time) > 50) {
+    if (reading != btn_state) {
+      btn_state = reading;
+      if (btn_state == LOW) {
+        playTrack(1, 2);
+        btn_press_start = millis();
+        if (taximeter_mode) {
+          if (!taxi_running) {
+            taxi_running = true;
+            taxi_start_time = millis();
+          } else {
+            taxi_running = false;
+            taxi_accumulated += (millis() - taxi_start_time);
+          }
+          drawScreen(false);
+        }
+        long_press_handled = false;
+      }
+      if (btn_state == HIGH) {
+        if (!long_press_handled && !taximeter_mode) {
+          display_mode++;
+          if (display_mode > MAX_MODES) display_mode = 0;
+          drawScreen(true);
+        }
+      }
+    }
+  }
+  if (btn_state == LOW && !long_press_handled) {
+    if (display_mode == 5 && !taximeter_mode && (millis() - btn_press_start > 10000)) {
+      engine_total_seconds = 0;
+      pref.putUInt("sec", 0);
+      playTrack(1, 5);
+      tft.fillScreen(COLOR_OK);
+      tft.setTextColor(TFT_BLACK);
+      tft.setTextSize(4);
+      tft.setCursor(60, 100);
+      tft.print("RESET OK!");
+      delay(1500);
+      tft.fillScreen(TFT_BLACK);
+      drawScreen(true);
+      long_press_handled = true;
+    }
+    if (taximeter_mode && (millis() - btn_press_start > 2000)) {
+      taxi_accumulated = 0;
+      taxi_running = false;
+      playTrack(1, 5);
+      tft.fillRect(0, 50, 320, 190, TFT_BLACK);
+      drawScreen(false);
+      long_press_handled = true;
+    }
+  }
+  if (millis() - timer_update > 200) {
+    sensors.requestTemperatures();
+    float t = sensors.getTempCByIndex(0);
+    if (t > -55 && t < 150) { tempC = t + corr_temp; }
+    float adc_sum = 0;
+    for (int i = 0; i < 20; i++) adc_sum += analogRead(PIN_VOLT);
+    static float smooth_volt = 0;
+    float inst_volt = ((adc_sum / 20.0) / 4095.0) * 3.3 * 5.6;
+    if (smooth_volt == 0) smooth_volt = inst_volt;
+    smooth_volt = (smooth_volt * 0.9) + (inst_volt * 0.1);
+    volt = smooth_volt + corr_volt;
+    if (volt > 5.0) {
+      if (volt < volt_min) volt_min = volt;
+      if (volt > volt_max) volt_max = volt;
+    }
+    noInterrupts();
+    int p_rpm = rpm_pulses;
+    rpm_pulses = 0;
+    int p_spd = speed_pulses;
+    speed_pulses = 0;
+    interrupts();
+    unsigned long dt = millis() - timer_update;
+    timer_update = millis();
+    rpm = ((p_rpm * 60 * 1000) / dt / 2) + corr_rpm;
+    if (p_spd > 0) speed_kmh = (p_spd * 3600000) / (pulses_per_km * dt);
+    else speed_kmh = 0;
+    hist_temp[buf_idx] = (int)tempC;
+    hist_volt[buf_idx] = (int)volt;
+    hist_rpm[buf_idx] = rpm;
+    buf_idx = (buf_idx + 1) % BUF_W;
+    if (rpm > 0) {
+      if (rpm > rpm_max) rpm_max = rpm;
+      if (rpm > 400) {
+        if (rpm < rpm_min) rpm_min = rpm;
+      }
+    }
+    static unsigned long error_start_time = 0;
+    static unsigned long last_strobe = 0;
+    static bool alarm_blink = false;
+    static unsigned long alarm_snd = 0;
+    bool has_error = (tempC >= 104 || (volt < 11.6 && volt > 5.0));
+    if (has_error) {
+      if (error_start_time == 0) error_start_time = millis();
+      if (millis() - error_start_time > 2000) {
+        if (millis() - last_strobe > 300) {
+          last_strobe = millis();
+          alarm_blink = !alarm_blink;
+          drawCheckEngineError(alarm_blink);
+        }
+        if (alarm_snd == 0 || millis() - alarm_snd > 15000) {
+          playTrack(1, 3);
+          alarm_snd = millis();
+          if (alarm_snd == 0) alarm_snd = 1;
+        }
+        return;
+      }
+    } else {
+      error_start_time = 0;
+      if (alarm_blink) {
+        alarm_blink = false;
+        tft.fillScreen(TFT_BLACK);
+        drawScreen(true);
+      }
+    }
+    if (display_mode != 1 && display_mode != 6 && display_mode != 7 && display_mode != 8) drawScreen(false);
+    if (taximeter_mode) drawScreen(false);
+  }
+  if (display_mode == 1 && !taximeter_mode && millis() % 1000 < 50) {
+    drawScreen(false);
+    delay(50);
+  }
+  static unsigned long last_mh = 0;
+  if (millis() - last_mh > 1000) {
+    last_mh = millis();
+    if (rpm > 300) {
+      engine_total_seconds++;
+      if (engine_total_seconds % 60 == 0) pref.putUInt("sec", engine_total_seconds);
+    }
+  }
+}
