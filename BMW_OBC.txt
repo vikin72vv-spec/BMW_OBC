@@ -1,0 +1,1026 @@
+/*
+ * ==========================================
+ * PROJECT: BMW E34 OBC "M-PERFORMANCE"
+ * VERSION: 16.9 (TEMP MAX & LAYOUT)
+ * FIX: Moved Arcs down on Temp/Volt screens + Added MAX Temp display
+ * BASE: V16.8
+ * ==========================================
+ */
+
+#include <WiFi.h>
+#include <HTTPClient.h>
+#include <WiFiClientSecure.h>
+#include <HardwareSerial.h>
+#include <Wire.h>
+#include <RTClib.h>
+#include <OneWire.h>
+#include <DallasTemperature.h>
+#include <Preferences.h>
+#include <WebServer.h>
+#include <Update.h>
+#include <ESPmDNS.h>
+#include <WiFiUdp.h>
+#include <ArduinoOTA.h>
+#include <esp_task_wdt.h>
+#include <TinyGPSPlus.h>
+#include <DFRobotDFPlayerMini.h>
+
+#define LGFX_USE_V1
+#include <LovyanGFX.hpp>
+#include <lvgl.h>
+#include <ArduinoJson.h>
+
+// ================= НАСТРОЙКИ =================
+const char* wifi_ssid = "arduino";
+const char* wifi_pass = "12345678";
+
+const char* OWM_KEY = "de96804e73a17f33576c4e8dc1551bf2";
+const char* CITY_NAME = "Mineralnye Vody";
+const float LATITUDE = 44.21;
+const float LONGITUDE = 43.13;
+
+const char* FIRMWARE_URL = "https://raw.githubusercontent.com/vikin72vv-spec/BMW_OBC/main/BMW_OBC.bin";
+String CURRENT_VERSION = "16.9";
+#define WDT_TIMEOUT 10
+
+// ПИНЫ
+#define PIN_SCLK 12
+#define PIN_MOSI 11
+#define PIN_MISO 40
+#define PIN_DC 38
+#define PIN_CS 10
+#define PIN_RST 39
+#define PIN_BLK 42
+#define MP3_RX 16
+#define MP3_TX 17
+#define GPS_RX_PIN 46
+#define GPS_TX_PIN -1
+#define PIN_BUTTON 15
+#define PIN_DS18B20 21
+#define PIN_VOLT 4
+#define PIN_RPM 5
+#define PIN_SDA 1
+#define PIN_SCL 2
+
+// ЛИМИТЫ
+#define SERVICE_LIMIT_HOURS 300
+#define SERVICE_LIMIT_KM 10000
+
+// === ДРАЙВЕР ДИСПЛЕЯ ===
+class LGFX : public lgfx::LGFX_Device {
+  lgfx::Panel_ST7789 _panel_instance;
+  lgfx::Bus_SPI _bus_instance;
+public:
+  LGFX(void) {
+    {
+      auto cfg = _bus_instance.config();
+      cfg.spi_host = SPI2_HOST;
+      cfg.freq_write = 40000000;
+      cfg.pin_sclk = PIN_SCLK;
+      cfg.pin_mosi = PIN_MOSI;
+      cfg.pin_miso = PIN_MISO;
+      cfg.pin_dc = PIN_DC;
+      cfg.dma_channel = 1;
+      _bus_instance.config(cfg);
+      _panel_instance.setBus(&_bus_instance);
+    }
+    {
+      auto cfg = _panel_instance.config();
+      cfg.pin_cs = PIN_CS;
+      cfg.pin_rst = PIN_RST;
+      cfg.pin_busy = -1;
+      cfg.panel_width = 240;
+      cfg.panel_height = 320;
+      cfg.offset_rotation = 0;
+      cfg.readable = false;
+      cfg.invert = false;
+      cfg.rgb_order = false;
+      cfg.bus_shared = true;
+      _panel_instance.config(cfg);
+    }
+    setPanel(&_panel_instance);
+  }
+};
+LGFX tft;
+
+static const uint32_t screenWidth = 320;
+static const uint32_t screenHeight = 240;
+static lv_disp_draw_buf_t draw_buf;
+static lv_color_t buf1[screenWidth * 20];
+static lv_color_t buf2[screenWidth * 20];
+
+// === ОБЪЕКТЫ UI ===
+lv_obj_t* tv;
+// T1
+lv_obj_t* arc_rpm_bg;
+lv_obj_t* arc_rpm;
+lv_obj_t* label_speed;
+lv_obj_t* label_kmh;
+lv_obj_t* label_rpm_small;
+lv_obj_t* label_m_perf;
+lv_obj_t* label_main_volt;
+lv_obj_t* label_main_temp;
+lv_obj_t* label_sat_count;
+// T2
+lv_obj_t* arc_temp;
+lv_obj_t* label_temp_val;
+lv_obj_t* label_temp_title;
+lv_obj_t* label_m_perf_t2;
+lv_obj_t* label_temp_max;  // NEW
+// T3
+lv_obj_t* arc_volt;
+lv_obj_t* label_volt_val;
+lv_obj_t* label_volt_title;
+lv_obj_t* label_volt_min;
+lv_obj_t* label_volt_max;
+lv_obj_t* label_m_perf_t3;
+// T4
+lv_obj_t* label_service_title;
+lv_obj_t* bar_service[5];
+lv_obj_t* bar_service_yellow;
+lv_obj_t* bar_service_red;
+lv_obj_t* label_service_status;
+lv_obj_t* label_service_hours;
+lv_obj_t* label_service_km;
+lv_obj_t* label_m_perf_t4;
+lv_obj_t* label_total_engine;
+lv_obj_t* label_daily_trip;
+// T5
+lv_obj_t* label_clock_time;
+lv_obj_t* label_clock_date;
+lv_obj_t* label_m_perf_t5;
+// T6
+lv_obj_t* label_weather_city;
+lv_obj_t* label_weather_data;
+lv_obj_t* label_weather_big;
+
+HardwareSerial myMP3(2);
+HardwareSerial gpsSerial(1);
+TinyGPSPlus gps;
+RTC_DS3231 rtc;
+OneWire oneWire(PIN_DS18B20);
+DallasTemperature sensors(&oneWire);
+Preferences pref;
+WebServer server(80);
+
+// ПЕРЕМЕННЫЕ
+volatile int rpm_pulses = 0;
+int rpm = 0;
+int speed_kmh = 0;
+float volt = 0.0;
+float tempC = -127.0;
+int pulses_per_km = 4712;
+int corr_temp = 0;
+int corr_rpm = 0;
+float corr_volt = 0.0;
+String weatherDesc = "Loading...";
+float tempAir = 0.0;
+bool weatherUpdated = false;
+
+// Statistics
+float stat_volt_min = 20.0;
+float stat_volt_max = 0.0;
+float stat_temp_max = -127.0;  // NEW
+
+bool alarm_temp_triggered = false;
+bool alarm_volt_triggered = false;
+volatile int target_tab_index = -1;
+int sat_count = 0;
+int brightness_level = 200;
+bool demo_mode = false;
+
+unsigned long engine_total_seconds = 0;
+unsigned long service_seconds = 0;
+unsigned long service_meters = 0;
+unsigned long daily_meters = 0;
+int last_saved_day = -1;
+
+bool service_alert_active = false;
+bool blink_state = false;
+
+unsigned long btn_press_start = 0;
+bool btn_long_press_handled = false;
+unsigned long last_sound_time = 0;
+
+// TEMP ASYNC VARS
+unsigned long last_temp_request = 0;
+bool temp_requested = false;
+
+void IRAM_ATTR rpm_interrupt() {
+  rpm_pulses++;
+}
+
+void my_disp_flush(lv_disp_drv_t* disp, const lv_area_t* area, lv_color_t* color_p) {
+  uint32_t w = (area->x2 - area->x1 + 1);
+  uint32_t h = (area->y2 - area->y1 + 1);
+  tft.startWrite();
+  tft.setAddrWindow(area->x1, area->y1, w, h);
+  tft.writePixels((lgfx::rgb565_t*)&color_p->full, w * h);
+  tft.endWrite();
+  lv_disp_flush_ready(disp);
+}
+
+// === SOUND DIRECT ===
+void sendMP3Command(byte command, byte dat1, byte dat2) {
+  byte buffer[10] = { 0x7E, 0xFF, 0x06, command, 0x00, dat1, dat2, 0x00, 0x00, 0xEF };
+  uint16_t sum = 0;
+  for (int i = 1; i < 7; i++) sum += buffer[i];
+  sum = -sum;
+  buffer[7] = (byte)(sum >> 8);
+  buffer[8] = (byte)(sum);
+  myMP3.write(buffer, 10);
+}
+
+void playTrack(int folder, int track) {
+  if (millis() - last_sound_time > 2000) {  // Anti-spam
+    sendMP3Command(0x0F, (byte)folder, (byte)track);
+    last_sound_time = millis();
+  }
+}
+
+void switchTabSafe(int tab_index) {
+  lv_tabview_set_act(tv, tab_index, LV_ANIM_OFF);
+  pref.putInt("tab", tab_index);
+}
+
+void resetService() {
+  service_seconds = 0;
+  service_meters = 0;
+  pref.putUInt("srv_s", 0);
+  pref.putUInt("srv_m", 0);
+  playTrack(1, 5);
+  lv_label_set_text(label_service_status, "RESET DONE!");
+  lv_obj_set_style_text_color(label_service_status, lv_color_hex(0x00FF00), 0);
+}
+
+void resetDaily() {
+  daily_meters = 0;
+  pref.putUInt("day_m", 0);
+}
+
+// === MOVED UP: checkDailyReset (BEFORE update_gui) ===
+void checkDailyReset(int current_day) {
+  if (last_saved_day == -1) {
+    last_saved_day = current_day;
+    return;
+  }
+  if (current_day != last_saved_day) {
+    resetDaily();
+    last_saved_day = current_day;
+  }
+}
+
+static lv_style_t style_arc_bg;
+static lv_style_t style_arc_indic;
+
+void init_styles() {
+  lv_style_init(&style_arc_bg);
+  lv_style_set_arc_color(&style_arc_bg, lv_color_hex(0x202020));
+  lv_style_set_arc_width(&style_arc_bg, 20);
+  lv_style_init(&style_arc_indic);
+  lv_style_set_arc_width(&style_arc_indic, 20);
+  lv_style_set_arc_rounded(&style_arc_indic, false);
+}
+
+// === HELPER FUNCTIONS ===
+
+void update_gui() {
+  lv_label_set_text_fmt(label_speed, "%d", speed_kmh);
+  lv_arc_set_value(arc_rpm, rpm);
+  lv_label_set_text_fmt(label_sat_count, "SAT: %d", sat_count);
+
+  // Main Panel Volt/Temp
+  String vMain = String(volt, 1) + " V";
+  lv_label_set_text(label_main_volt, vMain.c_str());
+
+  if (tempC > -50 && tempC < 150) {
+    lv_label_set_text_fmt(label_main_temp, "%d C", (int)tempC);
+  } else {
+    lv_label_set_text(label_main_temp, "-- C");
+  }
+
+  // RPM Colors
+  if (rpm < 3000) lv_obj_set_style_arc_color(arc_rpm, lv_color_hex(0x00A0FF), LV_PART_INDICATOR);
+  else if (rpm < 5500) lv_obj_set_style_arc_color(arc_rpm, lv_color_hex(0x00FF00), LV_PART_INDICATOR);
+  else if (rpm < 6500) lv_obj_set_style_arc_color(arc_rpm, lv_color_hex(0xFF9000), LV_PART_INDICATOR);
+  else lv_obj_set_style_arc_color(arc_rpm, lv_color_hex(0xFF0000), LV_PART_INDICATOR);
+
+  // Temp Arc
+  if (tempC < -50 || tempC > 150) {
+    lv_label_set_text(label_temp_val, "--");
+    lv_arc_set_value(arc_temp, 0);
+    lv_obj_set_style_arc_color(arc_temp, lv_color_hex(0x202020), LV_PART_INDICATOR);
+  } else {
+    lv_arc_set_value(arc_temp, (int)tempC);
+    lv_label_set_text_fmt(label_temp_val, "%d", (int)tempC);
+    if (tempC < 50) lv_obj_set_style_arc_color(arc_temp, lv_color_hex(0x00A0FF), LV_PART_INDICATOR);
+    else if (tempC > 105) lv_obj_set_style_arc_color(arc_temp, lv_color_hex(0xFF0000), LV_PART_INDICATOR);
+    else lv_obj_set_style_arc_color(arc_temp, lv_color_hex(0x00FF00), LV_PART_INDICATOR);
+
+    // Update MAX Temp
+    if (tempC > stat_temp_max) stat_temp_max = tempC;
+    String tMaxStr = "MAX: " + String((int)stat_temp_max) + " C";
+    lv_label_set_text(label_temp_max, tMaxStr.c_str());
+  }
+
+  // Volt Arc
+  String vVal = String(volt, 1);
+  lv_label_set_text(label_volt_val, vVal.c_str());
+
+  int arc_val = (int)(volt * 10);
+  if (arc_val < 100) arc_val = 100;
+  if (arc_val > 160) arc_val = 160;
+  lv_arc_set_value(arc_volt, arc_val);
+
+  if (volt < 11.8 || volt > 15.0) lv_obj_set_style_arc_color(arc_volt, lv_color_hex(0xFF0000), LV_PART_INDICATOR);
+  else lv_obj_set_style_arc_color(arc_volt, lv_color_hex(0x00A0FF), LV_PART_INDICATOR);
+
+  if (volt > 5.0) {
+    if (stat_volt_min > volt) stat_volt_min = volt;
+    if (stat_volt_max < volt) stat_volt_max = volt;
+
+    String vMin = "MIN: " + String(stat_volt_min, 1);
+    String vMax = "MAX: " + String(stat_volt_max, 1);
+    lv_label_set_text(label_volt_min, vMin.c_str());
+    lv_label_set_text(label_volt_max, vMax.c_str());
+  }
+
+  // Service
+  unsigned long hours = service_seconds / 3600;
+  unsigned long km = service_meters / 1000;
+
+  if (hours >= SERVICE_LIMIT_HOURS || km >= SERVICE_LIMIT_KM) service_alert_active = true;
+  else service_alert_active = false;
+
+  if (service_alert_active) {
+    static unsigned long blink_timer = 0;
+    if (millis() - blink_timer > 500) {
+      blink_timer = millis();
+      blink_state = !blink_state;
+      if (blink_state) {
+        lv_label_set_text(label_service_status, "SERVICE REQUIRED!");
+        lv_obj_set_style_text_color(label_service_status, lv_color_hex(0xFF0000), 0);
+      } else {
+        lv_label_set_text(label_service_status, "");
+      }
+    }
+  } else {
+    lv_label_set_text(label_service_status, "SYSTEM OK");
+    lv_obj_set_style_text_color(label_service_status, lv_color_hex(0x00FF00), 0);
+  }
+
+  int remaining_h = SERVICE_LIMIT_HOURS - hours;
+  if (remaining_h < 0) remaining_h = 0;
+  int greens_active = map(remaining_h, 0, SERVICE_LIMIT_HOURS, 0, 5);
+  for (int i = 0; i < 5; i++) {
+    if (i < greens_active) lv_obj_set_style_bg_color(bar_service[i], lv_color_hex(0x00FF00), 0);
+    else lv_obj_set_style_bg_color(bar_service[i], lv_color_hex(0x222222), 0);
+  }
+
+  lv_label_set_text_fmt(label_service_hours, "Intv: %lu h / %d", hours, SERVICE_LIMIT_HOURS);
+  lv_label_set_text_fmt(label_service_km, "Intv: %lu km / %d", km, SERVICE_LIMIT_KM);
+  lv_label_set_text_fmt(label_total_engine, "TOTAL ENGINE: %lu h", engine_total_seconds / 3600);
+
+  float trip = daily_meters / 1000.0;
+  String tripStr = "DAILY: " + String(trip, 1) + " km";
+  lv_label_set_text(label_daily_trip, tripStr.c_str());
+
+  DateTime now = rtc.now();
+  lv_label_set_text_fmt(label_clock_time, "%02d:%02d", now.hour(), now.minute());
+  lv_label_set_text_fmt(label_clock_date, "%02d / %02d / %d", now.day(), now.month(), now.year());
+
+  checkDailyReset(now.day());
+  if (weatherUpdated) {
+    String tStr = String(tempAir, 0) + " C";
+    lv_label_set_text(label_weather_big, tStr.c_str());
+    lv_label_set_text(label_weather_data, weatherDesc.c_str());
+  }
+}
+
+void checkAlarms() {
+  if (tempC > 102) {
+    if (!alarm_temp_triggered) {
+      playTrack(1, 2);
+      alarm_temp_triggered = true;
+    }
+  } else {
+    if (tempC < 100) alarm_temp_triggered = false;
+  }
+  if (volt > 1.0 && (volt < 11.5 || volt > 15.0)) {
+    if (!alarm_volt_triggered) {
+      playTrack(1, 3);
+      alarm_volt_triggered = true;
+    }
+  } else {
+    if (volt > 11.8 && volt < 14.8) alarm_volt_triggered = false;
+  }
+}
+
+void updateWeather() {
+  if (WiFi.status() != WL_CONNECTED) return;
+  WiFiClient client;
+  HTTPClient http;
+  String url = "http://api.openweathermap.org/data/2.5/weather?lat=" + String(LATITUDE) + "&lon=" + String(LONGITUDE) + "&appid=" + OWM_KEY + "&units=metric&lang=en";
+  http.begin(client, url);
+  if (http.GET() == 200) {
+    String payload = http.getString();
+    JsonDocument doc;
+    deserializeJson(doc, payload);
+    tempAir = doc["main"]["temp"];
+    const char* d = doc["weather"][0]["main"];
+    weatherDesc = String(d);
+    weatherUpdated = true;
+  }
+  http.end();
+}
+
+void performOTA() {
+  tft.fillScreen(TFT_BLACK);
+  tft.setTextColor(0xFD20, TFT_BLACK);
+  tft.setTextSize(2);
+  tft.setCursor(10, 50);
+  tft.println("UPDATING...");
+  WiFiClientSecure client;
+  client.setInsecure();
+  HTTPClient http;
+  http.setTimeout(30000);
+  http.begin(client, FIRMWARE_URL);
+  if (http.GET() == 200) {
+    int len = http.getSize();
+    if (Update.begin(len)) {
+      WiFiClient* stream = http.getStreamPtr();
+      uint8_t buff[128];
+      int total = 0;
+      while (http.connected() && (total < len)) {
+        esp_task_wdt_reset();
+        size_t size = stream->available();
+        if (size) {
+          int c = stream->readBytes(buff, ((size > sizeof(buff)) ? sizeof(buff) : size));
+          Update.write(buff, c);
+          total += c;
+          tft.fillRect(10, 100, map(total, 0, len, 0, 300), 20, 0x07E0);
+        }
+      }
+      if (Update.end() && Update.isFinished()) {
+        tft.fillScreen(0x07E0);
+        tft.setCursor(50, 100);
+        tft.println("SUCCESS!");
+        delay(1000);
+        ESP.restart();
+      }
+    }
+  }
+  http.end();
+  tft.fillScreen(0xF800);
+  delay(2000);
+}
+
+void build_ui() {
+  init_styles();
+  tv = lv_tabview_create(lv_scr_act(), LV_DIR_TOP, 0);
+  lv_obj_set_style_bg_color(tv, lv_color_hex(0x000000), LV_PART_MAIN);
+  lv_obj_add_flag(lv_tabview_get_tab_btns(tv), LV_OBJ_FLAG_HIDDEN);
+
+  lv_obj_t* t1 = lv_tabview_add_tab(tv, "Sport");
+  lv_obj_t* t2 = lv_tabview_add_tab(tv, "Temp");
+  lv_obj_t* t3 = lv_tabview_add_tab(tv, "Volt");
+  lv_obj_t* t4 = lv_tabview_add_tab(tv, "Service");
+  lv_obj_t* t5 = lv_tabview_add_tab(tv, "Clock");
+  lv_obj_t* t6 = lv_tabview_add_tab(tv, "Weather");
+
+  // T1 - SPORT
+  arc_rpm_bg = lv_arc_create(t1);
+  lv_obj_set_size(arc_rpm_bg, 200, 200);
+  lv_obj_align(arc_rpm_bg, LV_ALIGN_CENTER, 0, 20);
+  lv_arc_set_rotation(arc_rpm_bg, 135);
+  lv_arc_set_bg_angles(arc_rpm_bg, 0, 270);
+  lv_obj_remove_style(arc_rpm_bg, NULL, LV_PART_KNOB);
+  lv_obj_remove_style(arc_rpm_bg, NULL, LV_PART_INDICATOR);
+  lv_obj_add_style(arc_rpm_bg, &style_arc_bg, LV_PART_MAIN);
+
+  arc_rpm = lv_arc_create(t1);
+  lv_obj_set_size(arc_rpm, 200, 200);
+  lv_obj_align(arc_rpm, LV_ALIGN_CENTER, 0, 20);
+  lv_arc_set_rotation(arc_rpm, 135);
+  lv_arc_set_bg_angles(arc_rpm, 0, 270);
+  lv_arc_set_range(arc_rpm, 0, 8000);
+  lv_obj_remove_style(arc_rpm, NULL, LV_PART_KNOB);
+  lv_obj_set_style_arc_color(arc_rpm, lv_color_hex(0x000000), LV_PART_MAIN);
+  lv_obj_add_style(arc_rpm, &style_arc_indic, LV_PART_INDICATOR);
+  lv_obj_set_style_arc_color(arc_rpm, lv_color_hex(0xFF9000), LV_PART_INDICATOR);
+
+  label_speed = lv_label_create(t1);
+  lv_label_set_text(label_speed, "0");
+  lv_obj_set_style_text_font(label_speed, &lv_font_montserrat_48, 0);
+  lv_obj_align(label_speed, LV_ALIGN_CENTER, 0, 0);
+  lv_obj_set_style_text_color(label_speed, lv_color_hex(0xFFFFFF), 0);
+
+  label_kmh = lv_label_create(t1);
+  lv_label_set_text(label_kmh, "KM/H (GPS)");
+  lv_obj_set_style_text_font(label_kmh, &lv_font_montserrat_18, 0);
+  lv_obj_set_style_text_color(label_kmh, lv_color_hex(0xAAAAAA), 0);
+  lv_obj_align(label_kmh, LV_ALIGN_CENTER, 0, 35);
+  label_rpm_small = lv_label_create(t1);
+  lv_label_set_text(label_rpm_small, "0 rpm");
+  lv_obj_set_style_text_color(label_rpm_small, lv_color_hex(0xFF9000), 0);
+  lv_obj_align(label_rpm_small, LV_ALIGN_CENTER, 0, 60);
+
+  label_m_perf = lv_label_create(t1);
+  lv_label_set_text(label_m_perf, "///M PERFORMANCE");
+  lv_obj_set_style_text_font(label_m_perf, &lv_font_montserrat_14, 0);
+  lv_obj_set_style_text_color(label_m_perf, lv_color_hex(0x00A0FF), 0);
+  lv_obj_align(label_m_perf, LV_ALIGN_TOP_MID, 0, 5);
+
+  label_main_volt = lv_label_create(t1);
+  lv_label_set_text(label_main_volt, "0.0 V");
+  lv_obj_set_style_text_font(label_main_volt, &lv_font_montserrat_18, 0);
+  lv_obj_set_style_text_color(label_main_volt, lv_color_hex(0x00A0FF), 0);
+  lv_obj_align(label_main_volt, LV_ALIGN_BOTTOM_LEFT, 5, -5);
+  label_main_temp = lv_label_create(t1);
+  lv_label_set_text(label_main_temp, "-- C");
+  lv_obj_set_style_text_font(label_main_temp, &lv_font_montserrat_18, 0);
+  lv_obj_set_style_text_color(label_main_temp, lv_color_hex(0xFF9000), 0);
+  lv_obj_align(label_main_temp, LV_ALIGN_BOTTOM_RIGHT, -5, -5);
+  label_sat_count = lv_label_create(t1);
+  lv_label_set_text(label_sat_count, "SAT: 0");
+  lv_obj_set_style_text_color(label_sat_count, lv_color_hex(0x888888), 0);
+  lv_obj_align(label_sat_count, LV_ALIGN_TOP_RIGHT, -5, 5);
+
+  // T2 - TEMP (UPDATED)
+  // Moved arc down (y=20)
+  arc_temp = lv_arc_create(t2);
+  lv_obj_set_size(arc_temp, 200, 200);
+  lv_obj_align(arc_temp, LV_ALIGN_CENTER, 0, 20);
+  lv_arc_set_rotation(arc_temp, 135);
+  lv_arc_set_bg_angles(arc_temp, 0, 270);
+  lv_arc_set_range(arc_temp, 0, 130);
+  lv_obj_remove_style(arc_temp, NULL, LV_PART_KNOB);
+  lv_obj_set_style_arc_color(arc_temp, lv_color_hex(0x151515), LV_PART_MAIN);
+  lv_obj_set_style_arc_width(arc_temp, 25, LV_PART_MAIN);
+  lv_obj_set_style_arc_color(arc_temp, lv_color_hex(0x00A0FF), LV_PART_INDICATOR);
+  lv_obj_set_style_arc_width(arc_temp, 25, LV_PART_INDICATOR);
+
+  label_temp_val = lv_label_create(t2);
+  lv_label_set_text(label_temp_val, "--");
+  lv_obj_set_style_text_font(label_temp_val, &lv_font_montserrat_48, 0);
+  lv_obj_set_style_text_color(label_temp_val, lv_color_hex(0xFFFFFF), 0);
+  lv_obj_align(label_temp_val, LV_ALIGN_CENTER, 0, 0);
+
+  label_temp_title = lv_label_create(t2);
+  lv_label_set_text(label_temp_title, "COOLANT");
+  lv_obj_set_style_text_color(label_temp_title, lv_color_hex(0xAAAAAA), 0);
+  lv_obj_align(label_temp_title, LV_ALIGN_CENTER, 0, 40);
+
+  label_m_perf_t2 = lv_label_create(t2);
+  lv_label_set_text(label_m_perf_t2, "///M PERFORMANCE");
+  lv_obj_set_style_text_font(label_m_perf_t2, &lv_font_montserrat_14, 0);
+  lv_obj_set_style_text_color(label_m_perf_t2, lv_color_hex(0x00A0FF), 0);
+  lv_obj_align(label_m_perf_t2, LV_ALIGN_TOP_MID, 0, 5);
+
+  // NEW: MAX Temp Label
+  label_temp_max = lv_label_create(t2);
+  lv_label_set_text(label_temp_max, "MAX: --");
+  lv_obj_set_style_text_color(label_temp_max, lv_color_hex(0xAAAAAA), 0);
+  lv_obj_align(label_temp_max, LV_ALIGN_BOTTOM_RIGHT, -10, -10);
+
+  // T3 - VOLT (UPDATED)
+  // Moved arc down (y=20)
+  arc_volt = lv_arc_create(t3);
+  lv_obj_set_size(arc_volt, 200, 200);
+  lv_obj_align(arc_volt, LV_ALIGN_CENTER, 0, 20);
+  lv_arc_set_rotation(arc_volt, 135);
+  lv_arc_set_bg_angles(arc_volt, 0, 270);
+  lv_arc_set_range(arc_volt, 100, 160);
+  lv_obj_remove_style(arc_volt, NULL, LV_PART_KNOB);
+  lv_obj_set_style_arc_color(arc_volt, lv_color_hex(0x151515), LV_PART_MAIN);
+  lv_obj_set_style_arc_width(arc_volt, 25, LV_PART_MAIN);
+  lv_obj_set_style_arc_color(arc_volt, lv_color_hex(0x00FF00), LV_PART_INDICATOR);
+  lv_obj_set_style_arc_width(arc_volt, 25, LV_PART_INDICATOR);
+
+  label_volt_val = lv_label_create(t3);
+  lv_label_set_text(label_volt_val, "0.0");
+  lv_obj_set_style_text_font(label_volt_val, &lv_font_montserrat_48, 0);
+  lv_obj_set_style_text_color(label_volt_val, lv_color_hex(0xFFFFFF), 0);
+  lv_obj_align(label_volt_val, LV_ALIGN_CENTER, 0, 0);
+
+  label_volt_title = lv_label_create(t3);
+  lv_label_set_text(label_volt_title, "BATTERY");
+  lv_obj_set_style_text_color(label_volt_title, lv_color_hex(0xAAAAAA), 0);
+  lv_obj_align(label_volt_title, LV_ALIGN_CENTER, 0, 40);
+
+  label_volt_min = lv_label_create(t3);
+  lv_label_set_text(label_volt_min, "MIN: --");
+  lv_obj_set_style_text_color(label_volt_min, lv_color_hex(0xAAAAAA), 0);
+  lv_obj_align(label_volt_min, LV_ALIGN_BOTTOM_LEFT, 10, -10);
+
+  label_volt_max = lv_label_create(t3);
+  lv_label_set_text(label_volt_max, "MAX: --");
+  lv_obj_set_style_text_color(label_volt_max, lv_color_hex(0xAAAAAA), 0);
+  lv_obj_align(label_volt_max, LV_ALIGN_BOTTOM_RIGHT, -10, -10);
+
+  label_m_perf_t3 = lv_label_create(t3);
+  lv_label_set_text(label_m_perf_t3, "///M PERFORMANCE");
+  lv_obj_set_style_text_font(label_m_perf_t3, &lv_font_montserrat_14, 0);
+  lv_obj_set_style_text_color(label_m_perf_t3, lv_color_hex(0x00A0FF), 0);
+  lv_obj_align(label_m_perf_t3, LV_ALIGN_TOP_MID, 0, 5);
+
+  // T4
+  label_service_title = lv_label_create(t4);
+  lv_label_set_text(label_service_title, "SERVICE INTERVAL");
+  lv_obj_set_style_text_font(label_service_title, &lv_font_montserrat_22, 0);
+  lv_obj_set_style_text_color(label_service_title, lv_color_hex(0xFF9000), 0);
+  lv_obj_align(label_service_title, LV_ALIGN_TOP_MID, 0, 5);
+  label_m_perf_t4 = lv_label_create(t4);
+  lv_label_set_text(label_m_perf_t4, "///M PERFORMANCE");
+  lv_obj_set_style_text_font(label_m_perf_t4, &lv_font_montserrat_14, 0);
+  lv_obj_set_style_text_color(label_m_perf_t4, lv_color_hex(0x00A0FF), 0);
+  lv_obj_align(label_m_perf_t4, LV_ALIGN_TOP_MID, 0, -15);
+  int start_x = -105;
+  for (int i = 0; i < 5; i++) {
+    bar_service[i] = lv_obj_create(t4);
+    lv_obj_set_size(bar_service[i], 30, 25);
+    lv_obj_align(bar_service[i], LV_ALIGN_CENTER, start_x + (i * 35), -50);
+    lv_obj_set_style_bg_color(bar_service[i], lv_color_hex(0x00FF00), 0);
+    lv_obj_set_style_border_width(bar_service[i], 0, 0);
+  }
+  bar_service_yellow = lv_obj_create(t4);
+  lv_obj_set_size(bar_service_yellow, 30, 25);
+  lv_obj_align(bar_service_yellow, LV_ALIGN_CENTER, start_x + (5 * 35), -50);
+  lv_obj_set_style_bg_color(bar_service_yellow, lv_color_hex(0xFFFF00), 0);
+  lv_obj_set_style_border_width(bar_service_yellow, 0, 0);
+  bar_service_red = lv_obj_create(t4);
+  lv_obj_set_size(bar_service_red, 30, 25);
+  lv_obj_align(bar_service_red, LV_ALIGN_CENTER, start_x + (6 * 35), -50);
+  lv_obj_set_style_bg_color(bar_service_red, lv_color_hex(0xFF0000), 0);
+  lv_obj_set_style_border_width(bar_service_red, 0, 0);
+  label_service_status = lv_label_create(t4);
+  lv_label_set_text(label_service_status, "OK");
+  lv_obj_set_style_text_font(label_service_status, &lv_font_montserrat_28, 0);
+  lv_obj_align(label_service_status, LV_ALIGN_CENTER, 0, -10);
+
+  label_service_hours = lv_label_create(t4);
+  lv_label_set_text(label_service_hours, "Interval: 0h");
+  lv_obj_align(label_service_hours, LV_ALIGN_CENTER, 0, 25);
+  label_service_km = lv_label_create(t4);
+  lv_label_set_text(label_service_km, "Interval: 0km");
+  lv_obj_align(label_service_km, LV_ALIGN_CENTER, 0, 45);
+  label_total_engine = lv_label_create(t4);
+  lv_label_set_text(label_total_engine, "TOTAL ENGINE: 0h");
+  lv_obj_set_style_text_color(label_total_engine, lv_color_hex(0xAAAAAA), 0);
+  lv_obj_align(label_total_engine, LV_ALIGN_CENTER, 0, 70);
+  label_daily_trip = lv_label_create(t4);
+  lv_label_set_text(label_daily_trip, "DAILY TRIP: 0.0 km");
+  lv_obj_set_style_text_font(label_daily_trip, &lv_font_montserrat_22, 0);
+  lv_obj_set_style_text_color(label_daily_trip, lv_color_hex(0x00A0FF), 0);
+  lv_obj_align(label_daily_trip, LV_ALIGN_CENTER, 0, 100);
+
+  // T5
+  label_clock_time = lv_label_create(t5);
+  lv_label_set_text(label_clock_time, "00:00");
+  lv_obj_set_style_text_font(label_clock_time, &lv_font_montserrat_48, 0);
+  lv_obj_set_style_text_color(label_clock_time, lv_color_hex(0xFF9000), 0);
+  lv_obj_align(label_clock_time, LV_ALIGN_CENTER, 0, -10);
+  label_clock_date = lv_label_create(t5);
+  lv_label_set_text(label_clock_date, "-- / -- / --");
+  lv_obj_set_style_text_font(label_clock_date, &lv_font_montserrat_22, 0);
+  lv_obj_set_style_text_color(label_clock_date, lv_color_hex(0xFFFFFF), 0);
+  lv_obj_align(label_clock_date, LV_ALIGN_CENTER, 0, 40);
+  label_m_perf_t5 = lv_label_create(t5);
+  lv_label_set_text(label_m_perf_t5, "///M PERFORMANCE");
+  lv_obj_set_style_text_font(label_m_perf_t5, &lv_font_montserrat_14, 0);
+  lv_obj_set_style_text_color(label_m_perf_t5, lv_color_hex(0x00A0FF), 0);
+  lv_obj_align(label_m_perf_t5, LV_ALIGN_TOP_MID, 0, 5);
+  // T6
+  label_weather_city = lv_label_create(t6);
+  lv_label_set_text(label_weather_city, CITY_NAME);
+  lv_obj_set_style_text_font(label_weather_city, &lv_font_montserrat_22, 0);
+  lv_obj_set_style_text_color(label_weather_city, lv_color_hex(0x00A0FF), 0);
+  lv_obj_align(label_weather_city, LV_ALIGN_TOP_MID, 0, 20);
+  label_weather_big = lv_label_create(t6);
+  lv_label_set_text(label_weather_big, "--");
+  lv_obj_set_style_text_font(label_weather_big, &lv_font_montserrat_48, 0);
+  lv_obj_set_style_text_color(label_weather_big, lv_color_hex(0xFFFFFF), 0);
+  lv_obj_align(label_weather_big, LV_ALIGN_CENTER, 0, 0);
+  label_weather_data = lv_label_create(t6);
+  lv_label_set_text(label_weather_data, "Wait WiFi...");
+  lv_obj_set_style_text_color(label_weather_data, lv_color_hex(0xFF9000), 0);
+  lv_obj_align(label_weather_data, LV_ALIGN_BOTTOM_MID, 0, -30);
+}
+
+void showStartupScreen() {
+  lv_obj_t* scr = lv_obj_create(NULL);
+  lv_obj_set_style_bg_color(scr, lv_color_hex(0x000000), 0);
+  lv_scr_load(scr);
+
+  lv_obj_t* label1 = lv_label_create(scr);
+  lv_label_set_text(label1, "BMW E34");
+  lv_obj_set_style_text_font(label1, &lv_font_montserrat_48, 0);
+  lv_obj_set_style_text_color(label1, lv_color_hex(0xFFFFFF), 0);
+  lv_obj_align(label1, LV_ALIGN_CENTER, 0, -40);
+
+  lv_obj_t* label2 = lv_label_create(scr);
+  lv_label_set_text(label2, "SYSTEM CHECK...");
+  lv_obj_set_style_text_font(label2, &lv_font_montserrat_22, 0);
+  lv_obj_set_style_text_color(label2, lv_color_hex(0xFF9000), 0);
+  lv_obj_align(label2, LV_ALIGN_CENTER, 0, 10);
+
+  lv_obj_t* bar = lv_bar_create(scr);
+  lv_obj_set_size(bar, 200, 10);
+  lv_obj_align(bar, LV_ALIGN_CENTER, 0, 50);
+  lv_bar_set_range(bar, 0, 100);
+  lv_obj_set_style_bg_color(bar, lv_color_hex(0x333333), LV_PART_MAIN);
+  lv_obj_set_style_bg_color(bar, lv_color_hex(0x00A0FF), LV_PART_INDICATOR);
+
+  playTrack(1, 1);
+  for (int i = 0; i <= 100; i += 2) {
+    lv_bar_set_value(bar, i, LV_ANIM_OFF);
+    lv_timer_handler();
+    delay(20);
+  }
+  delay(500);
+}
+
+// === SETUP & LOOP AT THE END ===
+
+void setup() {
+  Serial.begin(115200);
+  ledcAttach(PIN_BLK, 5000, 8);
+
+  myMP3.begin(9600, SERIAL_8N1, MP3_RX, MP3_TX);
+  delay(500);
+  sendMP3Command(0x06, 0, 30);
+
+  gpsSerial.begin(9600, SERIAL_8N1, GPS_RX_PIN, GPS_TX_PIN);
+  Wire.begin(PIN_SDA, PIN_SCL);
+  rtc.begin();
+
+  sensors.begin();
+  sensors.setWaitForConversion(false);
+  pref.begin("bmw", false);
+  corr_temp = pref.getInt("ct", 0);
+  corr_rpm = pref.getInt("cr", 0);
+  if (corr_rpm < -500) corr_rpm = 0;
+  corr_volt = pref.getFloat("cv", 0.0);
+  engine_total_seconds = pref.getUInt("sec", 0);
+  service_seconds = pref.getUInt("srv_s", 0);
+  service_meters = pref.getUInt("srv_m", 0);
+  daily_meters = pref.getUInt("day_m", 0);
+  brightness_level = pref.getInt("br", 200);
+  ledcWrite(PIN_BLK, brightness_level);
+
+  pinMode(PIN_RPM, INPUT_PULLUP);
+  attachInterrupt(digitalPinToInterrupt(PIN_RPM), rpm_interrupt, FALLING);
+  pinMode(PIN_BUTTON, INPUT_PULLUP);
+
+  tft.init();
+  tft.setRotation(1);
+  lv_init();
+  lv_disp_draw_buf_init(&draw_buf, buf1, buf2, screenWidth * 20);
+  static lv_disp_drv_t disp_drv;
+  lv_disp_drv_init(&disp_drv);
+  disp_drv.hor_res = screenWidth;
+  disp_drv.ver_res = screenHeight;
+  disp_drv.flush_cb = my_disp_flush;
+  disp_drv.draw_buf = &draw_buf;
+  lv_disp_drv_register(&disp_drv);
+
+  showStartupScreen();
+  lv_obj_clean(lv_scr_act());
+  build_ui();
+
+  int last_tab = pref.getInt("tab", 0);
+  if (last_tab > 5) last_tab = 0;
+  switchTabSafe(last_tab);
+
+  WiFi.begin(wifi_ssid, wifi_pass);
+  ArduinoOTA.setHostname("BMW-E34-OBC");
+  ArduinoOTA.begin();
+  server.on("/", []() {
+    String p = R"rawliteral(
+<!DOCTYPE HTML><html><head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
+<title>BMW M-Control</title>
+<style>
+body{font-family:sans-serif;background:#000;color:#ddd;margin:0;padding:5px}
+h3{margin:5px 0;font-size:16px;color:#f90;text-align:center}
+.grid{display:grid;grid-template-columns:1fr 1fr;gap:5px}
+.btn{background:#333;color:#fff;border:1px solid #555;padding:12px;border-radius:4px;font-size:14px;width:100%;cursor:pointer}
+.btn:active{background:#f90;color:#000}
+.red{background:#900;border-color:#c00}
+.grn{background:#060;border-color:#090}
+.full{grid-column:span 2}
+form{background:#111;padding:5px;border:1px solid #333;border-radius:4px;text-align:center}
+input{background:#222;color:#fff;border:1px solid #444;width:40px;text-align:center;padding:5px}
+input[type=range]{width:100%}
+</style>
+</head><body>
+<h3>BMW E34 M-CONTROL</h3>
+<div class="grid">
+ <button class="btn" onclick="fetch('/set?m=0')">SPORT</button>
+ <button class="btn" onclick="fetch('/set?m=1')">TEMP</button>
+ <button class="btn" onclick="fetch('/set?m=2')">VOLT</button>
+ <button class="btn" onclick="fetch('/set?m=3')">SERVICE</button>
+ <button class="btn" onclick="fetch('/set?m=4')">CLOCK</button>
+ <button class="btn" onclick="fetch('/set?m=5')">WEATHER</button>
+</div>
+<hr style="border-color:#333">
+<div style="text-align:center;padding:5px">
+ Brightness: <span id="bv">%BR%</span><br>
+ <input type="range" min="10" max="255" value="%BR%" onchange="fetch('/set_bri?v='+this.value);document.getElementById('bv').innerText=this.value">
+</div>
+<hr style="border-color:#333">
+<div class="grid">
+ <button class="btn" onclick="fetch('/demo?v=1')">DEMO: %D%</button>
+</div>
+<hr style="border-color:#333">
+<form action="/set_corr" target="hidden_iframe">
+ T:<input name="t" value="%CT%"> R:<input name="r" value="%CR%"> V:<input name="v" value="%CV%">
+ <button class="btn" style="margin-top:5px;padding:5px">SAVE</button>
+</form>
+<iframe name="hidden_iframe" style="display:none;"></iframe>
+<hr style="border-color:#333">
+<div class="grid">
+ <button class="btn" onclick="fetch('/rst_day')">RESET DAY TRIP</button>
+ <button class="btn red" onclick="if(confirm('RESET SERVICE?')) fetch('/reset_service')">RESET SERVICE</button>
+ <button class="btn red" onclick="if(confirm('Reboot?')) fetch('/reboot')">REBOOT</button>
+ <button class="btn grn" onclick="if(confirm('Update FW?')) fetch('/ota')">UPDATE</button>
+</div>
+</body></html>
+)rawliteral";
+    p.replace("%CT%", String(corr_temp));
+    p.replace("%CR%", String(corr_rpm));
+    p.replace("%CV%", String(corr_volt));
+    p.replace("%BR%", String(brightness_level));
+    p.replace("%D%", demo_mode ? "ON" : "OFF");
+    server.send(200, "text/html", p);
+  });
+  server.on("/set", []() {
+    if (server.hasArg("m")) {
+      int m = server.arg("m").toInt();
+      target_tab_index = m;
+    }
+    server.send(200, "text/plain", "OK");
+  });
+  server.on("/demo", []() {
+    if (server.hasArg("v")) { demo_mode = !demo_mode; }
+    server.send(200, "text/plain", "OK");
+  });
+  server.on("/set_bri", []() {
+    if (server.hasArg("v")) {
+      brightness_level = server.arg("v").toInt();
+      ledcWrite(PIN_BLK, brightness_level);
+      pref.putInt("br", brightness_level);
+    }
+    server.send(200, "text/plain", "OK");
+  });
+  server.on("/set_corr", []() {
+    if (server.hasArg("t")) {
+      corr_temp = server.arg("t").toInt();
+      pref.putInt("ct", corr_temp);
+    }
+    if (server.hasArg("r")) {
+      corr_rpm = server.arg("r").toInt();
+      pref.putInt("cr", corr_rpm);
+    }
+    if (server.hasArg("v")) {
+      corr_volt = server.arg("v").toFloat();
+      pref.putFloat("cv", corr_volt);
+    }
+    server.send(200, "text/plain", "Saved");
+  });
+  server.on("/reset_service", []() {
+    resetService();
+    server.send(200, "text/plain", "OK");
+  });
+  server.on("/rst_day", []() {
+    resetDaily();
+    server.send(200, "text/plain", "OK");
+  });
+  server.on("/reboot", []() {
+    server.send(200);
+    delay(100);
+    ESP.restart();
+  });
+  server.on("/ota", []() {
+    server.send(200, "text/plain", "OK");
+    performOTA();
+  });
+  server.begin();
+
+  sensors.requestTemperatures();
+}
+
+void loop() {
+  lv_timer_handler();
+  ArduinoOTA.handle();
+  server.handleClient();
+  esp_task_wdt_reset();
+  if (target_tab_index != -1) {
+    if (target_tab_index >= 0 && target_tab_index <= 5) {
+      switchTabSafe(target_tab_index);
+      playTrack(1, 4);
+    }
+    target_tab_index = -1;
+  }
+
+  static unsigned long last_update = 0;
+  if (millis() - last_update > 100) {
+    unsigned long dt = millis() - last_update;
+    last_update = millis();
+
+    if (demo_mode) {
+      static int demo_rpm_dir = 1;
+      rpm += (200 * demo_rpm_dir);
+      if (rpm > 6500) demo_rpm_dir = -1;
+      if (rpm < 800) demo_rpm_dir = 1;
+      speed_kmh = rpm / 30;
+      if (tempC < 90) tempC += 0.5;
+      volt = 13.8 + ((float)random(0, 5) / 10.0);
+    } else {
+      int max_gps_read = 100;
+      while (gpsSerial.available() > 0 && max_gps_read-- > 0) gps.encode(gpsSerial.read());
+
+      noInterrupts();
+      int pr = rpm_pulses;
+      rpm_pulses = 0;
+      interrupts();
+      rpm = ((pr * 60 * 1000) / (int)dt / 3) + corr_rpm;
+      if (rpm < 0) rpm = 0;
+      if (gps.speed.isValid()) {
+        speed_kmh = gps.speed.kmph();
+        float mps = gps.speed.mps();
+        if (mps > 1.0) {
+          float dist = (mps * (dt / 1000.0));
+          service_meters += dist;
+          daily_meters += dist;
+        }
+      } else {
+        speed_kmh = 0;
+      }
+      sat_count = gps.satellites.value();
+
+      float adc = 0;
+      for (int i = 0; i < 5; i++) adc += analogRead(PIN_VOLT);
+      volt = ((adc / 5.0) / 4095.0) * 3.3 * 5.6 + corr_volt;
+
+      if (millis() - last_temp_request > 1000) {
+        if (temp_requested) {
+          float t = sensors.getTempCByIndex(0);
+          if (t > -50 && t < 150) tempC = t + corr_temp;
+          else tempC = -127;
+          temp_requested = false;
+        }
+        sensors.requestTemperatures();
+        temp_requested = true;
+        last_temp_request = millis();
+      }
+
+      static unsigned long sec_tick = 0;
+      if (millis() - sec_tick > 1000) {
+        sec_tick = millis();
+        if (rpm > 300) {
+          engine_total_seconds++;
+          service_seconds++;
+        }
+        if (engine_total_seconds % 60 == 0) {
+          pref.putUInt("sec", engine_total_seconds);
+          pref.putUInt("srv_s", service_seconds);
+          pref.putUInt("srv_m", service_meters);
+          pref.putUInt("day_m", daily_meters);
+        }
+      }
+      checkAlarms();
+    }
+
+    static unsigned long weather_timer = 0;
+    if (millis() - weather_timer > 600000 || (!weatherUpdated && millis() > 10000 && millis() - weather_timer > 30000)) {
+      weather_timer = millis();
+      updateWeather();
+    }
+    update_gui();
+  }
+
+  int btn = digitalRead(PIN_BUTTON);
+  int current_tab = lv_tabview_get_tab_act(tv);
+  if (btn == LOW) {
+    if (btn_press_start == 0) btn_press_start = millis();
+    if (!btn_long_press_handled && current_tab == 3 && (millis() - btn_press_start > 12000)) {
+      resetService();
+      btn_long_press_handled = true;
+    }
+  } else {
+    if (btn_press_start != 0 && !btn_long_press_handled) {
+      if (millis() - btn_press_start > 50) {
+        int act = lv_tabview_get_tab_act(tv);
+        act++;
+        if (act > 5) act = 0;
+        switchTabSafe(act);
+        playTrack(1, 4);
+      }
+    }
+    btn_press_start = 0;
+    btn_long_press_handled = false;
+  }
+  delay(5);
+}
